@@ -9,6 +9,7 @@ data/**/*.png
 data/**/*.webp
 data/**/*.bmp
 data/**/*.gif
+data/**/*.txt
 # Архивы исходных выгрузок
 data/**/*.zip
 data/**/*.7z
