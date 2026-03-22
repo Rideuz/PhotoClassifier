@@ -1,0 +1,625 @@
+"""
+Обучение и оценка multitask ResNet50 на DeepFashion (img_highres).
+
+Полный датасет (по умолчанию):
+  python train_resnet.py --output-dir runs/full
+
+Быстрый прогон — случайная стратифицированная подвыборка по категории (типу):
+  python train_resnet.py --max-samples 15000 --epochs 10 --output-dir runs/quick
+
+Первые N записей файла (без стратификации подвыборки):
+  python train_resnet.py --max-samples 5000 --subset-selection first_n --rebuild-splits
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torchvision import transforms
+from tqdm import tqdm
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "src"))
+
+from photoclassifier.config import TrainConfig
+from photoclassifier.data.annotations import (
+    build_color_coarse_names,
+    build_label_spaces,
+    compute_multitask_labels,
+    load_aligned_tables,
+)
+from photoclassifier.data.deepfashion import DeepFashionMultiTaskDataset
+from photoclassifier.data.paths import scan_img_highres_keys
+from photoclassifier.data.subset import apply_dataset_subset
+from photoclassifier.data.splits import load_splits, make_stratified_splits, save_splits
+from photoclassifier.metrics.multitask import (
+    coarse_color_group_accuracy,
+    collect_predictions,
+    confusion_matrix_np,
+    evaluate_with_logits,
+    save_confusion_matrix_csv,
+)
+from photoclassifier.models.resnet_multitask import MultiTaskResNet
+from photoclassifier.utils.repro import hardware_and_versions_report, set_seed
+
+
+def log(msg: str) -> None:
+    print(f"[PhotoClassifier] {msg}", flush=True)
+
+
+def config_to_jsonable(cfg: TrainConfig) -> dict:
+    d = vars(cfg).copy()
+    for k, v in d.items():
+        if isinstance(v, Path):
+            d[k] = str(v)
+    return d
+
+
+def verify_split_coverage(
+    y: np.ndarray,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    test_idx: np.ndarray,
+    name: str,
+) -> list[str]:
+    warnings: list[str] = []
+    all_c = set(np.unique(y).tolist())
+    for split, tag in (
+        (train_idx, "train"),
+        (val_idx, "val"),
+        (test_idx, "test"),
+    ):
+        present = set(np.unique(y[split]).tolist())
+        missing = all_c - present
+        if missing:
+            warnings.append(
+                f"{name}: в {tag} нет классов {sorted(missing)[:10]}"
+                f"{'...' if len(missing) > 10 else ''} (всего {len(missing)})"
+            )
+    return warnings
+
+
+def build_color_group_mapping(color_attr_names: list[str], num_color_classes: int) -> tuple[list[int], list[str]]:
+    """Индекс класса цвета -> id грубой группы; последний класс = none."""
+    coarse_per_attr = build_color_coarse_names(color_attr_names)
+    uniq = sorted(set(coarse_per_attr))
+    gid = {g: i for i, g in enumerate(uniq)}
+    class_to_group = [gid[c] for c in coarse_per_attr]
+    none_gid = len(uniq)
+    class_to_group.append(none_gid)
+    group_names = uniq + ["none"]
+    assert len(class_to_group) == num_color_classes
+    return class_to_group, group_names
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-root", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--rebuild-splits", action="store_true")
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Подвыборка после фильтра по диску. По умолчанию — стратифицированная "
+        "случайная (пропорции классов типа одежды). См. --subset-selection.",
+    )
+    parser.add_argument(
+        "--subset-selection",
+        choices=("stratified", "first_n"),
+        default="stratified",
+        help="stratified: случайная подвыборка с сохранением долей категорий; "
+        "first_n: первые N строк аннотаций (как раньше).",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Отключить tqdm (прогресс по батчам и эпохам).",
+    )
+    parser.add_argument("--num-workers", type=int, default=None)
+    args = parser.parse_args()
+
+    cfg = TrainConfig()
+    if args.data_root is not None:
+        cfg.data_root = args.data_root
+    if args.output_dir is not None:
+        cfg.output_dir = args.output_dir
+    if args.epochs is not None:
+        cfg.epochs = args.epochs
+    if args.batch_size is not None:
+        cfg.batch_size = args.batch_size
+    if args.lr is not None:
+        cfg.lr = args.lr
+    if args.rebuild_splits:
+        cfg.rebuild_splits = True
+    if args.seed is not None:
+        cfg.random_seed = args.seed
+    if args.num_workers is not None:
+        cfg.num_workers = args.num_workers
+    cfg.validate_ratios()
+
+    show_progress = not args.no_progress
+
+    set_seed(cfg.random_seed)
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+
+    report = hardware_and_versions_report()
+    report["random_seed"] = cfg.random_seed
+    report["batch_size_train"] = cfg.batch_size
+    (cfg.output_dir / "run_environment.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log(f"Устройство: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
+    if device.type != "cuda":
+        log("CUDA недоступна — обучение на CPU будет заметно медленнее.")
+
+    anno_dir = cfg.data_root / cfg.anno_subdir
+    attr_cloth = anno_dir / "list_attr_cloth.txt"
+    category_cloth = anno_dir / "list_category_cloth.txt"
+
+    color_idx, style_idx, color_names, style_names = build_label_spaces(attr_cloth)
+    type_names: list[str] = []
+    with category_cloth.open(encoding="utf-8", errors="replace") as f:
+        n = int(f.readline().strip())
+        f.readline()
+        for _ in range(n):
+            type_names.append(f.readline().split()[0].strip())
+
+    log("Сканирую img_highres и сопоставляю с аннотациями (это может занять время)…")
+    existing = scan_img_highres_keys(cfg.data_root, cfg.image_subdir)
+    log(f"Найдено файлов на диске (ключей img/...): {len(existing)}")
+    paths, y_type, attr_mat = load_aligned_tables(anno_dir, existing)
+    log(f"Строк в аннотациях с файлом на диске: {len(paths)}")
+    paths, y_type, attr_mat, subset_meta = apply_dataset_subset(
+        paths,
+        y_type,
+        attr_mat,
+        args.max_samples,
+        args.subset_selection,
+        cfg.random_seed,
+    )
+    if subset_meta["subset_applied"]:
+        log(
+            f"Подвыборка: {subset_meta['subset_strategy']}, "
+            f"используется {subset_meta['subset_size_used']} из "
+            f"{subset_meta['full_after_disk_filter']} изображений."
+        )
+    else:
+        log("Используется полный доступный датасет (без усечения по --max-samples).")
+    y_color, y_style = compute_multitask_labels(attr_mat, color_idx, style_idx)
+
+    num_type = len(type_names)
+    num_color = len(color_idx) + 1
+    num_style = len(style_idx) + 1
+    color_class_to_group, color_group_names = build_color_group_mapping(color_names, num_color)
+
+    n_samples = len(paths)
+    all_idx = np.arange(n_samples, dtype=np.int64)
+    splits_path = cfg.output_dir / cfg.splits_file
+    manifest_path = cfg.output_dir / "subset_manifest.json"
+    subset_manifest = {**subset_meta, "random_seed": cfg.random_seed}
+
+    reuse_splits = splits_path.exists() and not cfg.rebuild_splits
+    if reuse_splits:
+        if not manifest_path.exists():
+            log("Нет subset_manifest.json — пересоздаю train/val/test для согласованности.")
+            reuse_splits = False
+        else:
+            try:
+                prev = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if prev != subset_manifest:
+                    log("Параметры подвыборки/сида изменились — пересоздаю splits.npz.")
+                    reuse_splits = False
+            except json.JSONDecodeError:
+                reuse_splits = False
+
+    if reuse_splits:
+        log(f"Загружаю сохранённые сплиты: {splits_path.name}")
+        train_idx, val_idx, test_idx = load_splits(splits_path)
+    else:
+        log(
+            f"Делю данные на train/val/test ({cfg.train_ratio:.0%}/"
+            f"{cfg.val_ratio:.0%}/{cfg.test_ratio:.0%}), стратификация по типу…"
+        )
+        train_idx, val_idx, test_idx = make_stratified_splits(
+            y_type,
+            all_idx,
+            cfg.random_seed,
+            cfg.train_ratio,
+            cfg.val_ratio,
+            cfg.test_ratio,
+        )
+        save_splits(splits_path, train_idx, val_idx, test_idx)
+        manifest_path.write_text(
+            json.dumps(subset_manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    for w in verify_split_coverage(y_type, train_idx, val_idx, test_idx, "type"):
+        print("Стратификация:", w)
+    for w in verify_split_coverage(y_color, train_idx, val_idx, test_idx, "color"):
+        print("Стратификация:", w)
+    for w in verify_split_coverage(y_style, train_idx, val_idx, test_idx, "style"):
+        print("Стратификация:", w)
+
+    meta = {
+        "num_samples": n_samples,
+        "num_type": num_type,
+        "num_color": num_color,
+        "num_style": num_style,
+        "color_attr_names": color_names,
+        "style_attr_count": len(style_names),
+        "splits": {
+            "train": int(len(train_idx)),
+            "val": int(len(val_idx)),
+            "test": int(len(test_idx)),
+        },
+        "color_coarse_groups": color_group_names,
+        "subset": subset_manifest,
+        "epochs_planned": cfg.epochs,
+        "batch_size": cfg.batch_size,
+        "lr": cfg.lr,
+        "optimizer": "AdamW",
+        "scheduler": "CosineAnnealingLR",
+        "image_size": cfg.image_size,
+    }
+    (cfg.output_dir / "dataset_meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    train_tf = transforms.Compose(
+        [
+            transforms.RandomResizedCrop(cfg.image_size, scale=(0.7, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(0.2, 0.2, 0.2, 0.05),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+    eval_tf = transforms.Compose(
+        [
+            transforms.Resize(int(cfg.image_size * 1.14)),
+            transforms.CenterCrop(cfg.image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+
+    full_ds = DeepFashionMultiTaskDataset(
+        cfg.data_root,
+        cfg.image_subdir,
+        paths,
+        y_type,
+        y_color,
+        y_style,
+        transform=None,
+    )
+
+    class TransformSubset(torch.utils.data.Dataset):
+        def __init__(self, base, indices, tf):
+            self.base = base
+            self.indices = indices
+            self.tf = tf
+
+        def __len__(self):
+            return len(self.indices)
+
+        def __getitem__(self, i):
+            j = int(self.indices[i])
+            item = self.base[j]
+            item["image"] = self.tf(item["image"])
+            return item
+
+    train_ds = TransformSubset(full_ds, train_idx, train_tf)
+    val_ds = TransformSubset(full_ds, val_idx, eval_tf)
+    test_ds = TransformSubset(full_ds, test_idx, eval_tf)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+
+    log("Создаю модель: ResNet50 (ImageNet) + головы type/color/style…")
+    model = MultiTaskResNet(num_type, num_color, num_style, pretrained=cfg.pretrained)
+    model = model.to(device)
+
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs)
+    ce = nn.CrossEntropyLoss()
+
+    def run_epoch(loader, train_mode: bool, desc: str = ""):
+        if train_mode:
+            model.train()
+        else:
+            model.eval()
+        totals = {"loss": 0.0, "n": 0, "type": 0.0, "color": 0.0, "style": 0.0}
+        it = loader
+        if show_progress:
+            it = tqdm(loader, desc=desc, leave=False)
+        for batch in it:
+            x = batch["image"].to(device, non_blocking=True)
+            yt = batch["y_type"].to(device, non_blocking=True)
+            yc = batch["y_color"].to(device, non_blocking=True)
+            ys = batch["y_style"].to(device, non_blocking=True)
+            if train_mode:
+                opt.zero_grad(set_to_none=True)
+            with torch.set_grad_enabled(train_mode):
+                out = model(x)
+                lt = ce(out["type"], yt)
+                lc = ce(out["color"], yc)
+                ls = ce(out["style"], ys)
+                loss = (
+                    cfg.loss_weights["type"] * lt
+                    + cfg.loss_weights["color"] * lc
+                    + cfg.loss_weights["style"] * ls
+                )
+            if train_mode:
+                loss.backward()
+                opt.step()
+            bs = x.size(0)
+            totals["loss"] += float(loss.item()) * bs
+            totals["type"] += float(lt.item()) * bs
+            totals["color"] += float(lc.item()) * bs
+            totals["style"] += float(ls.item()) * bs
+            totals["n"] += bs
+        for k in ("loss", "type", "color", "style"):
+            totals[k] /= max(totals["n"], 1)
+        return totals
+
+    history_rows = []
+    best_score = -1.0
+    best_path = cfg.output_dir / "best_model.pt"
+    t_train0 = time.perf_counter()
+
+    log(
+        f"Старт обучения: {cfg.epochs} эпох, batch_size={cfg.batch_size}, "
+        f"lr={cfg.lr}, train/val/test={len(train_idx)}/{len(val_idx)}/{len(test_idx)}."
+    )
+    epoch_iter = range(1, cfg.epochs + 1)
+    if show_progress:
+        epoch_iter = tqdm(epoch_iter, desc="Эпохи")
+
+    for epoch in epoch_iter:
+        t0 = time.perf_counter()
+        tr = run_epoch(train_loader, True, desc=f"train e{epoch}")
+        sched.step()
+        va = run_epoch(val_loader, False, desc=f"val e{epoch}")
+        targets, logits = collect_predictions(
+            model, val_loader, device, show_progress=show_progress, desc=f"val predict e{epoch}"
+        )
+        metrics = evaluate_with_logits(
+            logits["type"],
+            logits["color"],
+            logits["style"],
+            targets["type"],
+            targets["color"],
+            targets["style"],
+            num_type,
+            cfg.top_k_type,
+        )
+        pred_c = logits["color"].argmax(axis=1)
+        metrics["color_coarse_group_accuracy"] = coarse_color_group_accuracy(
+            targets["color"],
+            pred_c,
+            color_class_to_group,
+            len(color_group_names),
+        )
+        row = {
+            "epoch": epoch,
+            "lr": float(sched.get_last_lr()[0]),
+            "train_loss": tr["loss"],
+            "val_loss": va["loss"],
+            "val_type_acc": metrics["type_accuracy"],
+            "val_color_acc": metrics["color_accuracy"],
+            "val_style_acc": metrics["style_accuracy"],
+            "val_type_macro_f1": metrics["type_macro_f1"],
+            "val_color_macro_f1": metrics["color_macro_f1"],
+            "val_style_macro_f1": metrics["style_macro_f1"],
+            "val_type_topk_acc": metrics["type_topk_accuracy"],
+            "val_color_coarse_group_acc": metrics["color_coarse_group_accuracy"],
+            "time_epoch_sec": time.perf_counter() - t0,
+        }
+        history_rows.append(row)
+        pd.DataFrame(history_rows).to_csv(cfg.output_dir / "training_log.csv", index=False)
+
+        score = (
+            metrics["type_macro_f1"]
+            + metrics["color_macro_f1"]
+            + metrics["style_macro_f1"]
+        ) / 3.0
+        postfix = (
+            f"tl={tr['loss']:.3f} vl={va['loss']:.3f} "
+            f"t_acc={metrics['type_accuracy']:.2f} f1_avg={score:.3f}"
+        )
+        if show_progress and isinstance(epoch_iter, tqdm):
+            epoch_iter.set_postfix_str(postfix)
+        else:
+            log(f"Эпоха {epoch}/{cfg.epochs}: {postfix}")
+        if score > best_score:
+            best_score = score
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "epoch": epoch,
+                    "metrics": metrics,
+                    "config": config_to_jsonable(cfg),
+                },
+                best_path,
+            )
+
+    training_wall = time.perf_counter() - t_train0
+    (cfg.output_dir / "training_summary.json").write_text(
+        json.dumps(
+            {
+                "total_wall_time_sec": training_wall,
+                "epochs": cfg.epochs,
+                "best_val_avg_macro_f1": best_score,
+                "checkpoint": str(best_path),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    log(f"Обучение закончено за {training_wall:.1f} с. Загружаю лучший чекпоинт и оцениваю test…")
+    # Тест с лучшим чекпоинтом
+    try:
+        ckpt = torch.load(best_path, map_location=device, weights_only=False)
+    except TypeError:
+        ckpt = torch.load(best_path, map_location=device)
+    model.load_state_dict(ckpt["model"])
+    targets, logits = collect_predictions(
+        model, test_loader, device, show_progress=show_progress, desc="test predict"
+    )
+    test_metrics = evaluate_with_logits(
+        logits["type"],
+        logits["color"],
+        logits["style"],
+        targets["type"],
+        targets["color"],
+        targets["style"],
+        num_type,
+        cfg.top_k_type,
+    )
+    pred_c = logits["color"].argmax(axis=1)
+    test_metrics["color_coarse_group_accuracy"] = coarse_color_group_accuracy(
+        targets["color"],
+        pred_c,
+        color_class_to_group,
+        len(color_group_names),
+    )
+    (cfg.output_dir / "test_metrics.json").write_text(
+        json.dumps(test_metrics, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    # Confusion matrices (тип и стиль; цвет — малое число классов)
+    pt = logits["type"].argmax(axis=1)
+    ps = logits["style"].argmax(axis=1)
+    np.savez_compressed(
+        cfg.output_dir / "confusion_type.npz",
+        matrix=confusion_matrix_np(targets["type"], pt, num_type),
+        labels=np.arange(num_type),
+    )
+    np.savez_compressed(
+        cfg.output_dir / "confusion_style.npz",
+        matrix=confusion_matrix_np(targets["style"], ps, num_style),
+        labels=np.arange(num_style),
+    )
+    save_confusion_matrix_csv(
+        targets["type"],
+        pt,
+        type_names,
+        cfg.output_dir / "confusion_type.csv",
+        max_labels=60,
+    )
+
+    # Размер модели
+    param_count = sum(p.numel() for p in model.parameters())
+    tmp = cfg.output_dir / "_tmp_weights.pt"
+    torch.save(model.state_dict(), tmp)
+    disk_mb = tmp.stat().st_size / (1024 * 1024)
+    tmp.unlink(missing_ok=True)
+
+    log("Замер скорости инференса (warmup + батчи)…")
+    # Инференс
+    bench_bs1 = DataLoader(
+        TransformSubset(full_ds, test_idx[: min(512, len(test_idx))], eval_tf),
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+    )
+    bench_bs32 = DataLoader(
+        TransformSubset(full_ds, test_idx[: min(512, len(test_idx))], eval_tf),
+        batch_size=min(32, cfg.batch_size),
+        shuffle=False,
+        num_workers=0,
+    )
+
+    def bench_loader(loader: DataLoader, max_images: int = 128) -> float:
+        model.eval()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        it = iter(loader)
+        for _ in range(cfg.inference_warmup_batches):
+            batch = next(it, None)
+            if batch is None:
+                it = iter(loader)
+                batch = next(it)
+            x = batch["image"].to(device)
+            model(x)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        n_img = 0
+        t0 = time.perf_counter()
+        it = iter(loader)
+        while n_img < max_images:
+            batch = next(it, None)
+            if batch is None:
+                break
+            x = batch["image"].to(device)
+            model(x)
+            n_img += x.size(0)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+        return elapsed / max(n_img, 1) * 1000.0
+
+    inf_report: dict = {
+        "param_count": int(param_count),
+        "weights_disk_mb": float(disk_mb),
+        "note": "Время на изображение после warmup; GPU и версии — в run_environment.json",
+    }
+    try:
+        inf_report["inference_ms_per_image_batch1"] = float(bench_loader(bench_bs1))
+        inf_report["inference_ms_per_image_batchN"] = float(bench_loader(bench_bs32))
+        inf_report["inference_batch_size_N"] = int(min(32, cfg.batch_size))
+    except Exception as e:
+        inf_report["inference_error"] = repr(e)
+
+    (cfg.output_dir / "efficiency.json").write_text(
+        json.dumps(inf_report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    summary_csv = {
+        **{f"test_{k}": v for k, v in test_metrics.items() if isinstance(v, (int, float))},
+        **{f"eff_{k}": v for k, v in inf_report.items() if isinstance(v, (int, float))},
+    }
+    pd.DataFrame([summary_csv]).to_csv(cfg.output_dir / "final_summary.csv", index=False)
+
+    print("Готово. Артефакты в", cfg.output_dir)
+
+
+if __name__ == "__main__":
+    main()
