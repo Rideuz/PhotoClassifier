@@ -9,14 +9,14 @@ data/**/*.png
 data/**/*.webp
 data/**/*.bmp
 data/**/*.gif
-data/**/*.txt
+
+# Крупные файлы аннотаций DeepFashion (лимит GitHub 100 МБ)
+data/category_and_attribbute_prediction/Anno_coarse/list_attr_img.txt
+
 # Архивы исходных выгрузок
 data/**/*.zip
 data/**/*.7z
 data/**/*.rar
-
-# Очень большие файлы аннотаций (раскомментируйте, если не используете Git LFS)
-# data/**/list_attr_img.txt
 
 # --- Результаты экспериментов и веса ---
 runs/
