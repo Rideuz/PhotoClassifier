@@ -19,7 +19,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
+try:
+    import seaborn as sns
+except ImportError:
+    sns = None
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -161,18 +164,26 @@ def plot_confusion_heatmap(
     fig_h = min(14, max(6, n * 0.2))
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
     tick_labels = labels if labels is not None else [str(i) for i in range(matrix.shape[0])]
-    sns.heatmap(
-        norm,
-        ax=ax,
-        cmap="Blues",
-        vmin=0,
-        vmax=1,
-        square=False,
-        linewidths=0,
-        cbar_kws={"label": "Доля предсказаний по строке (нормализация по истине)"},
-        xticklabels=tick_labels,
-        yticklabels=tick_labels,
-    )
+    if sns is not None:
+        sns.heatmap(
+            norm,
+            ax=ax,
+            cmap="Blues",
+            vmin=0,
+            vmax=1,
+            square=False,
+            linewidths=0,
+            cbar_kws={"label": "Доля предсказаний по строке (нормализация по истине)"},
+            xticklabels=tick_labels,
+            yticklabels=tick_labels,
+        )
+    else:
+        im = ax.imshow(norm, cmap="Blues", vmin=0, vmax=1, aspect="auto")
+        fig.colorbar(im, ax=ax, label="Доля предсказаний по строке (нормализация по истине)")
+        ax.set_xticks(np.arange(len(tick_labels)))
+        ax.set_yticks(np.arange(len(tick_labels)))
+        ax.set_xticklabels(tick_labels)
+        ax.set_yticklabels(tick_labels)
     ax.set_title(title)
     ax.set_xlabel("Предсказанный класс")
     ax.set_ylabel("Истинный класс")
@@ -226,7 +237,8 @@ def main() -> None:
     plots_dir = run_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    sns.set_theme(style="whitegrid", context="notebook", font_scale=0.95)
+    if sns is not None:
+        sns.set_theme(style="whitegrid", context="notebook", font_scale=0.95)
 
     log_csv = run_dir / "training_log.csv"
     if not log_csv.exists():

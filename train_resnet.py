@@ -145,6 +145,11 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=None)
+    parser.add_argument("--image-size", type=int, default=None)
+    parser.add_argument("--loss-weight-type", type=float, default=None)
+    parser.add_argument("--loss-weight-color", type=float, default=None)
+    parser.add_argument("--loss-weight-style", type=float, default=None)
     parser.add_argument("--rebuild-splits", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
@@ -232,6 +237,12 @@ def main() -> None:
         cfg.batch_size = args.batch_size
     if args.lr is not None:
         cfg.lr = args.lr
+    if args.weight_decay is not None:
+        cfg.weight_decay = args.weight_decay
+    if args.image_size is not None:
+        if args.image_size <= 0:
+            raise SystemExit("--image-size должен быть положительным целым.")
+        cfg.image_size = args.image_size
     if args.rebuild_splits:
         cfg.rebuild_splits = True
     if args.seed is not None:
@@ -242,6 +253,12 @@ def main() -> None:
         cfg.num_workers_eval = args.eval_num_workers
     if args.no_amp:
         cfg.amp = False
+    if args.loss_weight_type is not None:
+        cfg.loss_weights["type"] = float(args.loss_weight_type)
+    if args.loss_weight_color is not None:
+        cfg.loss_weights["color"] = float(args.loss_weight_color)
+    if args.loss_weight_style is not None:
+        cfg.loss_weights["style"] = float(args.loss_weight_style)
     cfg.validate_ratios()
 
     if args.full_dataset:
@@ -435,6 +452,8 @@ def main() -> None:
     )
 
     meta = {
+        "architecture": "resnet",
+        "model_name": "resnet50",
         "num_samples": n_samples,
         "type_category_names": type_names,
         "num_type": num_type,
@@ -683,6 +702,8 @@ def main() -> None:
     (cfg.output_dir / "training_summary.json").write_text(
         json.dumps(
             {
+                "architecture": "resnet",
+                "model_name": "resnet50",
                 "total_wall_time_sec": training_wall,
                 "epochs": cfg.epochs,
                 "best_val_avg_macro_f1": best_score,
