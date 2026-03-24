@@ -48,3 +48,25 @@ class DeepFashionMultiTaskDataset(Dataset):
             "y_style": int(self.y_style[idx]),
             "path": self.paths[idx],
         }
+
+
+class TransformSubsetDataset(Dataset):
+    """
+    Подмножество по индексам + отдельный transform.
+    Класс объявлен на уровне модуля, чтобы DataLoader (num_workers>0) мог pickle на Windows.
+    """
+
+    def __init__(self, base: DeepFashionMultiTaskDataset, indices: np.ndarray, transform) -> None:
+        self.base = base
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return int(self.indices.shape[0])
+
+    def __getitem__(self, i: int):
+        j = int(self.indices[i])
+        item = self.base[j]
+        item = dict(item)
+        item["image"] = self.transform(item["image"])
+        return item

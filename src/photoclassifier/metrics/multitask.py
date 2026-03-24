@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 
 import numpy as np
@@ -110,6 +111,7 @@ def collect_predictions(
     device: torch.device,
     show_progress: bool = False,
     desc: str = "predict",
+    use_amp: bool = False,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     model.eval()
     lt, lc, ls = [], [], []
@@ -122,15 +124,23 @@ def collect_predictions(
             iterator = tqdm(loader, desc=desc, leave=False)
         except ImportError:
             iterator = loader
+    amp_on = bool(use_amp and device.type == "cuda")
     for batch in iterator:
         x = batch["image"].to(device, non_blocking=True)
         yt.append(batch["y_type"].detach().cpu().numpy())
         yc.append(batch["y_color"].detach().cpu().numpy())
         ys.append(batch["y_style"].detach().cpu().numpy())
-        out = model(x)
-        lt.append(out["type"].cpu().numpy())
-        lc.append(out["color"].cpu().numpy())
-        ls.append(out["style"].cpu().numpy())
+        try:
+            cm = torch.amp.autocast("cuda", dtype=torch.float16) if amp_on else contextlib.nullcontext()
+        except (TypeError, AttributeError):
+            from torch.cuda.amp import autocast as cuda_autocast
+
+            cm = cuda_autocast(enabled=amp_on) if amp_on else contextlib.nullcontext()
+        with cm:
+            out = model(x)
+        lt.append(out["type"].float().cpu().numpy())
+        lc.append(out["color"].float().cpu().numpy())
+        ls.append(out["style"].float().cpu().numpy())
     return (
         {
             "type": np.concatenate(yt),

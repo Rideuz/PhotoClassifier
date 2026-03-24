@@ -1,18 +1,27 @@
 """
 Обучение и оценка multitask ResNet50 на DeepFashion (img_highres).
 
-Полный датасет (по умолчанию):
-  python train_resnet.py --output-dir runs/full
+По умолчанию НЕ все ~289k изображений — берётся стратифицированная выжимка
+(default_max_samples в TrainConfig, сейчас 20k), чтобы итерации были терпимыми.
 
-Быстрый прогон — случайная стратифицированная подвыборка по категории (типу):
-  python train_resnet.py --max-samples 15000 --epochs 10 --output-dir runs/quick
+  python train_resnet.py --output-dir runs/dev
 
-Первые N записей файла (без стратификации подвыборки):
+Полный датасет (долго, для финальных прогонов):
+  python train_resnet.py --full-dataset --output-dir runs/full
+
+Меньше / больше образцов явно:
+  python train_resnet.py --max-samples 20000 --epochs 10 --output-dir runs/quick
+
+Первые N строк аннотаций (без стратификации подвыборки):
   python train_resnet.py --max-samples 5000 --subset-selection first_n --rebuild-splits
+
+Скорость: AMP, num_workers для train; val/test с num_workers=0 на Windows.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+from datetime import datetime
 import json
 import sys
 import time
@@ -36,8 +45,13 @@ from photoclassifier.data.annotations import (
     compute_multitask_labels,
     load_aligned_tables,
 )
-from photoclassifier.data.deepfashion import DeepFashionMultiTaskDataset
+from photoclassifier.data.deepfashion import DeepFashionMultiTaskDataset, TransformSubsetDataset
 from photoclassifier.data.paths import scan_img_highres_keys
+from photoclassifier.data.stratify_labels import (
+    build_split_stratify_array,
+    filter_indices_by_style_frequency,
+    split_stratify_stats,
+)
 from photoclassifier.data.subset import apply_dataset_subset
 from photoclassifier.data.splits import load_splits, make_stratified_splits, save_splits
 from photoclassifier.metrics.multitask import (
@@ -61,6 +75,30 @@ def config_to_jsonable(cfg: TrainConfig) -> dict:
         if isinstance(v, Path):
             d[k] = str(v)
     return d
+
+
+def resolve_run_dir(base_dir: Path, run_name: str | None, allow_overwrite: bool) -> Path:
+    """Return a safe output directory for the current experiment."""
+    if run_name:
+        candidate = base_dir / run_name
+    else:
+        candidate = base_dir
+
+    if allow_overwrite or not candidate.exists():
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    if candidate.is_dir() and not any(candidate.iterdir()):
+        candidate.mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if run_name:
+        resolved = base_dir / f"{run_name}_{ts}"
+    else:
+        resolved = base_dir.parent / f"{base_dir.name}_{ts}"
+    resolved.mkdir(parents=True, exist_ok=False)
+    return resolved
 
 
 def verify_split_coverage(
@@ -110,11 +148,28 @@ def main() -> None:
     parser.add_argument("--rebuild-splits", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument(
+        "--run-name",
+        type=str,
+        default=None,
+        help="Имя подкаталога эксперимента внутри --output-dir (например, resnet50_lr3e4_bs32).",
+    )
+    parser.add_argument(
+        "--overwrite-output",
+        action="store_true",
+        help="Разрешить запись в существующую непустую папку (иначе будет создана новая с timestamp).",
+    )
+    parser.add_argument(
+        "--full-dataset",
+        action="store_true",
+        help="Использовать все доступные на диске изображения (~289k). Без этого флага "
+        "берётся стратифицированная выжимка размера default_max_samples из TrainConfig.",
+    )
+    parser.add_argument(
         "--max-samples",
         type=int,
         default=None,
-        help="Подвыборка после фильтра по диску. По умолчанию — стратифицированная "
-        "случайная (пропорции классов типа одежды). См. --subset-selection.",
+        help="Число образцов после фильтра по диску (стратификация по типу). "
+        "Если не указано и нет --full-dataset — используется default_max_samples из конфига.",
     )
     parser.add_argument(
         "--subset-selection",
@@ -129,7 +184,42 @@ def main() -> None:
         help="Отключить tqdm (прогресс по батчам и эпохам).",
     )
     parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument(
+        "--eval-num-workers",
+        type=int,
+        default=None,
+        help="num_workers только для val/test (по умолчанию 0 на Windows — без лишних процессов).",
+    )
+    parser.add_argument(
+        "--no-amp",
+        action="store_true",
+        help="Отключить mixed precision (AMP) на CUDA.",
+    )
+    parser.add_argument(
+        "--split-stratify",
+        choices=("type", "type_coarse_style"),
+        default="type",
+        help="Чему соответствует stratify при train/val/test: только тип или тип+грубый стиль "
+        "(редкие стили в один бин — см. --style-stratify-min-freq).",
+    )
+    parser.add_argument(
+        "--style-stratify-min-freq",
+        type=int,
+        default=5,
+        help="Для type_coarse_style: стили реже этого числа образцов в текущей выборке "
+        "считаются одним «хвостовым» классом только для разбиения.",
+    )
+    parser.add_argument(
+        "--min-style-frequency",
+        type=int,
+        default=0,
+        help="Если >0 — удалить из датасета образцы, чей класс стиля встречается "
+        "реже N раз (уменьшает хвост, проще метрики; меньше классов в val).",
+    )
     args = parser.parse_args()
+
+    if args.full_dataset and args.max_samples is not None:
+        raise SystemExit("Укажите либо --full-dataset, либо --max-samples, не оба смысла сразу.")
 
     cfg = TrainConfig()
     if args.data_root is not None:
@@ -148,12 +238,36 @@ def main() -> None:
         cfg.random_seed = args.seed
     if args.num_workers is not None:
         cfg.num_workers = args.num_workers
+    if args.eval_num_workers is not None:
+        cfg.num_workers_eval = args.eval_num_workers
+    if args.no_amp:
+        cfg.amp = False
     cfg.validate_ratios()
+
+    if args.full_dataset:
+        effective_max_samples: int | None = None
+    elif args.max_samples is not None:
+        if args.max_samples <= 0:
+            raise SystemExit("--max-samples должен быть положительным целым.")
+        effective_max_samples = args.max_samples
+    else:
+        effective_max_samples = cfg.default_max_samples
 
     show_progress = not args.no_progress
 
     set_seed(cfg.random_seed)
-    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    cfg.output_dir = resolve_run_dir(cfg.output_dir, args.run_name, args.overwrite_output)
+    log(f"Каталог эксперимента: {cfg.output_dir}")
+
+    launch_info = {
+        "started_at_local": datetime.now().isoformat(timespec="seconds"),
+        "argv": sys.argv,
+        "config": config_to_jsonable(cfg),
+        "cli": {k: v for k, v in vars(args).items() if not isinstance(v, Path)},
+    }
+    (cfg.output_dir / "experiment_manifest.json").write_text(
+        json.dumps(launch_info, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
     report = hardware_and_versions_report()
     report["random_seed"] = cfg.random_seed
@@ -163,9 +277,25 @@ def main() -> None:
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = device.type == "cuda" and cfg.amp
     log(f"Устройство: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
     if device.type != "cuda":
         log("CUDA недоступна — обучение на CPU будет заметно медленнее.")
+    elif use_amp:
+        log("AMP (mixed precision, float16) на CUDA: включён — обычно быстрее и легче по VRAM.")
+    else:
+        log("AMP на CUDA выключен (--no-amp).")
+    if cfg.num_workers == 0:
+        log(
+            "Внимание: num_workers=0 — JPEG читает один поток, GPU часто простаивает. "
+            "Попробуйте --num-workers 4 (или 8), если нет ошибок multiprocessing."
+        )
+    else:
+        log(
+            f"DataLoader train: num_workers={cfg.num_workers}; "
+            f"val/test: num_workers={cfg.num_workers_eval} "
+            f"(отдельные воркеры там отключены по умолчанию — меньше риск WinError 1455 при загрузке CUDA)"
+        )
 
     anno_dir = cfg.data_root / cfg.anno_subdir
     attr_cloth = anno_dir / "list_attr_cloth.txt"
@@ -184,11 +314,20 @@ def main() -> None:
     log(f"Найдено файлов на диске (ключей img/...): {len(existing)}")
     paths, y_type, attr_mat = load_aligned_tables(anno_dir, existing)
     log(f"Строк в аннотациях с файлом на диске: {len(paths)}")
+    if args.full_dataset:
+        log("Режим: полный датасет (--full-dataset).")
+    elif args.max_samples is not None:
+        log(f"Режим: явная подвыборка --max-samples={args.max_samples}.")
+    else:
+        log(
+            f"Режим: стратифицированная выжимка по умолчанию "
+            f"(default_max_samples={cfg.default_max_samples}). Для всех изображений: --full-dataset."
+        )
     paths, y_type, attr_mat, subset_meta = apply_dataset_subset(
         paths,
         y_type,
         attr_mat,
-        args.max_samples,
+        effective_max_samples,
         args.subset_selection,
         cfg.random_seed,
     )
@@ -202,6 +341,22 @@ def main() -> None:
         log("Используется полный доступный датасет (без усечения по --max-samples).")
     y_color, y_style = compute_multitask_labels(attr_mat, color_idx, style_idx)
 
+    if args.min_style_frequency > 0:
+        n0 = len(paths)
+        keep = filter_indices_by_style_frequency(y_style, args.min_style_frequency)
+        paths = [p for p, k in zip(paths, keep) if k]
+        y_type = y_type[keep]
+        attr_mat = attr_mat[keep]
+        y_color = y_color[keep]
+        y_style = y_style[keep]
+        log(
+            f"Фильтр стиля: оставлены классы с частотой ≥{args.min_style_frequency} "
+            f"({len(paths)} / {n0} образцов)."
+        )
+
+    if len(paths) == 0:
+        raise RuntimeError("Нет образцов после фильтров — проверьте данные и --min-style-frequency.")
+
     num_type = len(type_names)
     num_color = len(color_idx) + 1
     num_style = len(style_idx) + 1
@@ -211,7 +366,16 @@ def main() -> None:
     all_idx = np.arange(n_samples, dtype=np.int64)
     splits_path = cfg.output_dir / cfg.splits_file
     manifest_path = cfg.output_dir / "subset_manifest.json"
-    subset_manifest = {**subset_meta, "random_seed": cfg.random_seed}
+    subset_meta = dict(subset_meta)
+    subset_meta["subset_size_used"] = n_samples
+    subset_manifest = {
+        **subset_meta,
+        "random_seed": cfg.random_seed,
+        "split_stratify": args.split_stratify,
+        "style_stratify_min_freq": args.style_stratify_min_freq,
+        "min_style_frequency_filter": args.min_style_frequency,
+        "n_samples": n_samples,
+    }
 
     reuse_splits = splits_path.exists() and not cfg.rebuild_splits
     if reuse_splits:
@@ -231,12 +395,18 @@ def main() -> None:
         log(f"Загружаю сохранённые сплиты: {splits_path.name}")
         train_idx, val_idx, test_idx = load_splits(splits_path)
     else:
+        stratify_y = build_split_stratify_array(
+            y_type,
+            y_style,
+            args.split_stratify,
+            args.style_stratify_min_freq,
+        )
         log(
             f"Делю данные на train/val/test ({cfg.train_ratio:.0%}/"
-            f"{cfg.val_ratio:.0%}/{cfg.test_ratio:.0%}), стратификация по типу…"
+            f"{cfg.val_ratio:.0%}/{cfg.test_ratio:.0%}), stratify={args.split_stratify}…"
         )
         train_idx, val_idx, test_idx = make_stratified_splits(
-            y_type,
+            stratify_y,
             all_idx,
             cfg.random_seed,
             cfg.train_ratio,
@@ -256,8 +426,17 @@ def main() -> None:
     for w in verify_split_coverage(y_style, train_idx, val_idx, test_idx, "style"):
         print("Стратификация:", w)
 
+    log(
+        "Про «пропуски» классов style в val/test: при ~227 классах и длинном хвосте "
+        "случайное разбиение почти всегда оставляет часть классов только в train — "
+        "это нормально. Macro-F1 по стилю тогда усредняет и нули для классов без "
+        "поддержки в сплите. См. micro-F1/accuracy и опции --split-stratify "
+        "type_coarse_style, --min-style-frequency."
+    )
+
     meta = {
         "num_samples": n_samples,
+        "type_category_names": type_names,
         "num_type": num_type,
         "num_color": num_color,
         "num_style": num_style,
@@ -276,6 +455,17 @@ def main() -> None:
         "optimizer": "AdamW",
         "scheduler": "CosineAnnealingLR",
         "image_size": cfg.image_size,
+        "amp": use_amp,
+        "num_workers": cfg.num_workers,
+        "num_workers_eval": cfg.num_workers_eval,
+        "split_stratify": args.split_stratify,
+        "style_stratify_min_freq": args.style_stratify_min_freq,
+        "min_style_frequency_filter": args.min_style_frequency,
+        "split_coverage_stats": {
+            "type": split_stratify_stats(y_type, train_idx, val_idx, test_idx, "type"),
+            "color": split_stratify_stats(y_color, train_idx, val_idx, test_idx, "color"),
+            "style": split_stratify_stats(y_style, train_idx, val_idx, test_idx, "style"),
+        },
     }
     (cfg.output_dir / "dataset_meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -309,45 +499,37 @@ def main() -> None:
         transform=None,
     )
 
-    class TransformSubset(torch.utils.data.Dataset):
-        def __init__(self, base, indices, tf):
-            self.base = base
-            self.indices = indices
-            self.tf = tf
+    train_ds = TransformSubsetDataset(full_ds, train_idx, train_tf)
+    val_ds = TransformSubsetDataset(full_ds, val_idx, eval_tf)
+    test_ds = TransformSubsetDataset(full_ds, test_idx, eval_tf)
 
-        def __len__(self):
-            return len(self.indices)
-
-        def __getitem__(self, i):
-            j = int(self.indices[i])
-            item = self.base[j]
-            item["image"] = self.tf(item["image"])
-            return item
-
-    train_ds = TransformSubset(full_ds, train_idx, train_tf)
-    val_ds = TransformSubset(full_ds, val_idx, eval_tf)
-    test_ds = TransformSubset(full_ds, test_idx, eval_tf)
+    def _dl_kwargs(nw: int) -> dict:
+        kw: dict = {
+            "num_workers": nw,
+            "pin_memory": device.type == "cuda",
+        }
+        if nw > 0:
+            kw["persistent_workers"] = True
+            kw["prefetch_factor"] = 2
+        return kw
 
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
         shuffle=True,
-        num_workers=cfg.num_workers,
-        pin_memory=(device.type == "cuda"),
+        **_dl_kwargs(cfg.num_workers),
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=cfg.batch_size,
         shuffle=False,
-        num_workers=cfg.num_workers,
-        pin_memory=(device.type == "cuda"),
+        **_dl_kwargs(cfg.num_workers_eval),
     )
     test_loader = DataLoader(
         test_ds,
         batch_size=cfg.batch_size,
         shuffle=False,
-        num_workers=cfg.num_workers,
-        pin_memory=(device.type == "cuda"),
+        **_dl_kwargs(cfg.num_workers_eval),
     )
 
     log("Создаю модель: ResNet50 (ImageNet) + головы type/color/style…")
@@ -357,6 +539,18 @@ def main() -> None:
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs)
     ce = nn.CrossEntropyLoss()
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    except (TypeError, AttributeError):
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    def _autocast():
+        if not use_amp:
+            return contextlib.nullcontext()
+        try:
+            return torch.amp.autocast("cuda", dtype=torch.float16)
+        except (TypeError, AttributeError):
+            return torch.cuda.amp.autocast()
 
     def run_epoch(loader, train_mode: bool, desc: str = ""):
         if train_mode:
@@ -375,18 +569,20 @@ def main() -> None:
             if train_mode:
                 opt.zero_grad(set_to_none=True)
             with torch.set_grad_enabled(train_mode):
-                out = model(x)
-                lt = ce(out["type"], yt)
-                lc = ce(out["color"], yc)
-                ls = ce(out["style"], ys)
-                loss = (
-                    cfg.loss_weights["type"] * lt
-                    + cfg.loss_weights["color"] * lc
-                    + cfg.loss_weights["style"] * ls
-                )
+                with _autocast():
+                    out = model(x)
+                    lt = ce(out["type"], yt)
+                    lc = ce(out["color"], yc)
+                    ls = ce(out["style"], ys)
+                    loss = (
+                        cfg.loss_weights["type"] * lt
+                        + cfg.loss_weights["color"] * lc
+                        + cfg.loss_weights["style"] * ls
+                    )
             if train_mode:
-                loss.backward()
-                opt.step()
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
             bs = x.size(0)
             totals["loss"] += float(loss.item()) * bs
             totals["type"] += float(lt.item()) * bs
@@ -416,7 +612,12 @@ def main() -> None:
         sched.step()
         va = run_epoch(val_loader, False, desc=f"val e{epoch}")
         targets, logits = collect_predictions(
-            model, val_loader, device, show_progress=show_progress, desc=f"val predict e{epoch}"
+            model,
+            val_loader,
+            device,
+            show_progress=show_progress,
+            desc=f"val predict e{epoch}",
+            use_amp=use_amp,
         )
         metrics = evaluate_with_logits(
             logits["type"],
@@ -501,7 +702,12 @@ def main() -> None:
         ckpt = torch.load(best_path, map_location=device)
     model.load_state_dict(ckpt["model"])
     targets, logits = collect_predictions(
-        model, test_loader, device, show_progress=show_progress, desc="test predict"
+        model,
+        test_loader,
+        device,
+        show_progress=show_progress,
+        desc="test predict",
+        use_amp=use_amp,
     )
     test_metrics = evaluate_with_logits(
         logits["type"],
@@ -555,13 +761,13 @@ def main() -> None:
     log("Замер скорости инференса (warmup + батчи)…")
     # Инференс
     bench_bs1 = DataLoader(
-        TransformSubset(full_ds, test_idx[: min(512, len(test_idx))], eval_tf),
+        TransformSubsetDataset(full_ds, test_idx[: min(512, len(test_idx))], eval_tf),
         batch_size=1,
         shuffle=False,
         num_workers=0,
     )
     bench_bs32 = DataLoader(
-        TransformSubset(full_ds, test_idx[: min(512, len(test_idx))], eval_tf),
+        TransformSubsetDataset(full_ds, test_idx[: min(512, len(test_idx))], eval_tf),
         batch_size=min(32, cfg.batch_size),
         shuffle=False,
         num_workers=0,

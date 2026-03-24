@@ -36,7 +36,12 @@ def make_stratified_splits(
             stratify=y_stratify[tv_idx],
         )
     except ValueError:
-        # Редкие классы: fallback без стратификации
+        # Редкие классы в y_stratify: sklearn не может сохранить доли
+        print(
+            "[PhotoClassifier] Предупреждение: stratify не удалась (класс с 1 объектом или аналог) — "
+            "используется случайное разбиение без стратификации.",
+            flush=True,
+        )
         tv_idx, te_idx = train_test_split(
             indices, test_size=test_size, random_state=seed, shuffle=True
         )

@@ -15,12 +15,23 @@ class TrainConfig:
     val_ratio: float = 0.15
     test_ratio: float = 0.15
 
-    epochs: int = 30
+    epochs: int = 10
     batch_size: int = 32
-    num_workers: int = 0
+    # 0 = загрузка картинок в главном процессе (часто узкое место и низкая загрузка GPU).
+    # На Windows с Python 3.8+ обычно работает 2–8; при зависаниях поставьте 0.
+    num_workers: int = 4
+    # Val/test: без отдельных процессов. На Windows spawn снова грузит torch/CUDA в каждом воркере
+    # и может дать WinError 1455 («файл подкачки слишком мал»).
+    num_workers_eval: int = 0
+    # Mixed precision на CUDA (быстрее и меньше VRAM на современных GPU)
+    amp: bool = True
     lr: float = 3e-4
     weight_decay: float = 0.01
     image_size: int = 224
+
+    # Обычный запуск train_resnet без флагов: не ~289k картинок, а стратифицированная выжимка
+    # (см. --full-dataset для полного датасета — долго, для финальных экспериментов ВКР).
+    default_max_samples: int = 20_000
 
     backbone: str = "resnet50"
     pretrained: bool = True
