@@ -170,6 +170,9 @@ def main() -> None:
     max_samples = manifest.get("subset_requested")
     subset_strategy = manifest.get("subset_strategy", "stratified")
     min_style = int(manifest.get("min_style_frequency_filter", 0))
+    style_balance_enabled = bool(manifest.get("style_balance_enabled", False))
+    style_balance_per_style = manifest.get("style_balance_per_style", None)
+    style_balance_kept_style_ids = manifest.get("style_balance_kept_style_ids", [])
     n_expected = int(manifest.get("n_samples", dataset_meta.get("num_samples", 0)))
 
     show_progress = not args.no_progress
@@ -207,6 +210,31 @@ def main() -> None:
         attr_mat = attr_mat[keep]
         y_color = y_color[keep]
         y_style = y_style[keep]
+
+    if style_balance_enabled:
+        if style_balance_per_style is None or not style_balance_kept_style_ids:
+            log("style-balanced: в manifest нет параметров — пропускаю уравнивание.")
+        else:
+            k = int(style_balance_per_style)
+            rng = np.random.default_rng(seed)
+            sel: list[int] = []
+            for sid in style_balance_kept_style_ids:
+                sid = int(sid)
+                idxs = np.flatnonzero(y_style == sid).astype(np.int64)
+                if idxs.shape[0] < k:
+                    continue
+                picked = rng.choice(idxs, size=k, replace=False)
+                sel.extend(picked.tolist())
+
+            sel = np.array(sorted(set(sel)), dtype=np.int64)
+            if sel.shape[0] == 0:
+                log("style-balanced: после отбора не осталось данных — пропускаю уравнивание.")
+            else:
+                paths = [paths[i] for i in sel.tolist()]
+                y_type = y_type[sel]
+                attr_mat = attr_mat[sel]
+                y_color = y_color[sel]
+                y_style = y_style[sel]
 
     if len(paths) == 0:
         raise RuntimeError("После фильтров нет образцов — проверьте data-root и датасет.")

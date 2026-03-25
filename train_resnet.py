@@ -54,6 +54,7 @@ from photoclassifier.data.stratify_labels import (
 )
 from photoclassifier.data.subset import apply_dataset_subset
 from photoclassifier.data.splits import load_splits, make_stratified_splits, save_splits
+from photoclassifier.data.splits import make_style_coverage_splits
 from photoclassifier.metrics.multitask import (
     coarse_color_group_accuracy,
     collect_predictions,
@@ -202,7 +203,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--split-stratify",
-        choices=("type", "type_coarse_style"),
+        choices=("type", "type_coarse_style", "style_coverage"),
         default="type",
         help="Чему соответствует stratify при train/val/test: только тип или тип+грубый стиль "
         "(редкие стили в один бин — см. --style-stratify-min-freq).",
@@ -220,6 +221,26 @@ def main() -> None:
         default=0,
         help="Если >0 — удалить из датасета образцы, чей класс стиля встречается "
         "реже N раз (уменьшает хвост, проще метрики; меньше классов в val).",
+    )
+    parser.add_argument(
+        "--style-balanced-subset",
+        action="store_true",
+        help="Отобрать подвыборку с уравниванием количества примеров на стиль (кап/равное число на стиль). "
+        "Это улучшает macro-F1 по style, уменьшая дисбаланс и эффект отсутствующих стилей.",
+    )
+    parser.add_argument(
+        "--style-balance-min-keep",
+        type=int,
+        default=3,
+        help="Минимальная поддержка стиля (кол-во примеров в текущем подмножестве), чтобы стиль участвовал в "
+        "style-balanced подборке и гарантированных split-ах.",
+    )
+    parser.add_argument(
+        "--style-balance-per-style",
+        type=int,
+        default=None,
+        help="Сколько примеров оставлять на каждый стиль в style-balanced режиме. "
+        "Если не задано — вычисляется автоматически из max_samples и числа стилей.",
     )
     args = parser.parse_args()
 
@@ -371,6 +392,67 @@ def main() -> None:
             f"({len(paths)} / {n0} образцов)."
         )
 
+    style_balance_info: dict = {
+        "style_balance_enabled": bool(args.style_balanced_subset),
+        "style_balance_per_style": None,
+        "style_balance_min_keep": args.style_balance_min_keep,
+        "style_balance_kept_style_ids": [],
+        "style_balance_total_samples": None,
+    }
+
+    if args.style_balanced_subset:
+        before_n = len(paths)
+        counts = np.bincount(y_style.astype(np.int64))
+        eligible_style_ids = [int(i) for i, c in enumerate(counts.tolist()) if c >= args.style_balance_min_keep]
+
+        if not eligible_style_ids:
+            log(
+                "style-balanced: нет стилей с поддержкой "
+                f">={args.style_balance_min_keep} — пропускаю уравнивание."
+            )
+        else:
+            k_requested = args.style_balance_per_style
+            if k_requested is not None:
+                k = int(k_requested)
+            else:
+                # Авто-K: целимcя в равенство на текущем размере после min_style_frequency фильтра.
+                k = int(before_n // max(1, len(eligible_style_ids)))
+                k = max(args.style_balance_min_keep, k)
+
+            eligible_style_ids0 = eligible_style_ids
+            # Чтобы сохранить равные количества, отбрасываем стили, у которых поддержка меньше k.
+            eligible_style_ids = [sid for sid in eligible_style_ids0 if counts[sid] >= k]
+            if not eligible_style_ids:
+                # fallback: гарантируем не пустой набор
+                k = int(args.style_balance_min_keep)
+                eligible_style_ids = eligible_style_ids0
+
+            if eligible_style_ids:
+                k = int(min(k, min(counts[sid] for sid in eligible_style_ids)))
+
+            rng = np.random.default_rng(cfg.random_seed)
+            sel: list[int] = []
+            for sid in sorted(eligible_style_ids):
+                idxs = np.flatnonzero(y_style == sid).astype(np.int64)
+                if idxs.shape[0] < k:
+                    continue
+                picked = rng.choice(idxs, size=k, replace=False)
+                sel.extend(picked.tolist())
+
+            sel = np.array(sorted(set(sel)), dtype=np.int64)
+            if sel.shape[0] == 0:
+                log("style-balanced: после отбора не осталось данных — пропускаю уравнивание.")
+            else:
+                paths = [paths[i] for i in sel.tolist()]
+                y_type = y_type[sel]
+                attr_mat = attr_mat[sel]
+                y_color = y_color[sel]
+                y_style = y_style[sel]
+
+                style_balance_info["style_balance_per_style"] = int(k)
+                style_balance_info["style_balance_kept_style_ids"] = sorted(int(s) for s in set(y_style.tolist()))
+                style_balance_info["style_balance_total_samples"] = int(sel.shape[0])
+
     if len(paths) == 0:
         raise RuntimeError("Нет образцов после фильтров — проверьте данные и --min-style-frequency.")
 
@@ -391,6 +473,7 @@ def main() -> None:
         "split_stratify": args.split_stratify,
         "style_stratify_min_freq": args.style_stratify_min_freq,
         "min_style_frequency_filter": args.min_style_frequency,
+        **style_balance_info,
         "n_samples": n_samples,
     }
 
@@ -412,24 +495,35 @@ def main() -> None:
         log(f"Загружаю сохранённые сплиты: {splits_path.name}")
         train_idx, val_idx, test_idx = load_splits(splits_path)
     else:
-        stratify_y = build_split_stratify_array(
-            y_type,
-            y_style,
-            args.split_stratify,
-            args.style_stratify_min_freq,
-        )
         log(
             f"Делю данные на train/val/test ({cfg.train_ratio:.0%}/"
-            f"{cfg.val_ratio:.0%}/{cfg.test_ratio:.0%}), stratify={args.split_stratify}…"
+            f"{cfg.val_ratio:.0%}/{cfg.test_ratio:.0%}), split={args.split_stratify}…"
         )
-        train_idx, val_idx, test_idx = make_stratified_splits(
-            stratify_y,
-            all_idx,
-            cfg.random_seed,
-            cfg.train_ratio,
-            cfg.val_ratio,
-            cfg.test_ratio,
-        )
+        if args.split_stratify == "style_coverage":
+            train_idx, val_idx, test_idx = make_style_coverage_splits(
+                y_style=y_style,
+                indices=all_idx,
+                seed=cfg.random_seed,
+                train_ratio=cfg.train_ratio,
+                val_ratio=cfg.val_ratio,
+                test_ratio=cfg.test_ratio,
+                min_per_split=1,
+            )
+        else:
+            stratify_y = build_split_stratify_array(
+                y_type,
+                y_style,
+                args.split_stratify,
+                args.style_stratify_min_freq,
+            )
+            train_idx, val_idx, test_idx = make_stratified_splits(
+                stratify_y,
+                all_idx,
+                cfg.random_seed,
+                cfg.train_ratio,
+                cfg.val_ratio,
+                cfg.test_ratio,
+            )
         save_splits(splits_path, train_idx, val_idx, test_idx)
         manifest_path.write_text(
             json.dumps(subset_manifest, ensure_ascii=False, indent=2),

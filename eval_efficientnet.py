@@ -89,10 +89,35 @@ def main() -> None:
     )
     y_color, y_style = compute_multitask_labels(attr_mat, color_idx, style_idx)
     min_style = int(manifest.get("min_style_frequency_filter", 0))
+    style_balance_enabled = bool(manifest.get("style_balance_enabled", False))
+    style_balance_per_style = manifest.get("style_balance_per_style", None)
+    style_balance_kept_style_ids = manifest.get("style_balance_kept_style_ids", [])
+    seed = int(manifest.get("random_seed", 42))
     if min_style > 0:
         keep = filter_indices_by_style_frequency(y_style, min_style)
         paths = [p for p, k in zip(paths, keep) if k]
         y_type, y_color, y_style = y_type[keep], y_color[keep], y_style[keep]
+
+    if style_balance_enabled:
+        if style_balance_per_style is None or not style_balance_kept_style_ids:
+            pass
+        else:
+            k = int(style_balance_per_style)
+            rng = np.random.default_rng(seed)
+            sel: list[int] = []
+            for sid in style_balance_kept_style_ids:
+                sid = int(sid)
+                idxs = np.flatnonzero(y_style == sid).astype(np.int64)
+                if idxs.shape[0] < k:
+                    continue
+                picked = rng.choice(idxs, size=k, replace=False)
+                sel.extend(picked.tolist())
+            sel = np.array(sorted(set(sel)), dtype=np.int64)
+            if sel.shape[0] > 0:
+                paths = [paths[i] for i in sel.tolist()]
+                y_type = y_type[sel]
+                y_color = y_color[sel]
+                y_style = y_style[sel]
 
     train_idx, val_idx, test_idx = load_splits(run_dir / "splits.npz")
     idx = {"train": train_idx, "val": val_idx, "test": test_idx}[args.split]

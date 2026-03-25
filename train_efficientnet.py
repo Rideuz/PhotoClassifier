@@ -45,7 +45,7 @@ from photoclassifier.data.stratify_labels import (
     split_stratify_stats,
 )
 from photoclassifier.data.subset import apply_dataset_subset
-from photoclassifier.data.splits import load_splits, make_stratified_splits, save_splits
+from photoclassifier.data.splits import load_splits, make_stratified_splits, save_splits, make_style_coverage_splits
 from photoclassifier.metrics.multitask import (
     coarse_color_group_accuracy,
     collect_predictions,
@@ -81,7 +81,19 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--eval-num-workers", type=int, default=None)
     parser.add_argument("--no-amp", action="store_true")
-    parser.add_argument("--split-stratify", choices=("type", "type_coarse_style"), default="type")
+    parser.add_argument("--split-stratify", choices=("type", "type_coarse_style", "style_coverage"), default="type")
+    parser.add_argument(
+        "--style-balanced-subset",
+        action="store_true",
+        help="Отобрать подвыборку с уравниванием количества примеров на стиль.",
+    )
+    parser.add_argument("--style-balance-min-keep", type=int, default=3, help="Минимальная поддержка стиля для style-balanced.")
+    parser.add_argument(
+        "--style-balance-per-style",
+        type=int,
+        default=None,
+        help="Сколько примеров оставлять на каждый стиль в style-balanced режиме (если не задано — авто).",
+    )
     parser.add_argument("--style-stratify-min-freq", type=int, default=5)
     parser.add_argument("--min-style-frequency", type=int, default=0)
     args = parser.parse_args()
@@ -178,6 +190,63 @@ def main() -> None:
         paths = [p for p, k in zip(paths, keep) if k]
         y_type, y_color, y_style = y_type[keep], y_color[keep], y_style[keep]
 
+    style_balance_info: dict = {
+        "style_balance_enabled": bool(args.style_balanced_subset),
+        "style_balance_per_style": None,
+        "style_balance_min_keep": args.style_balance_min_keep,
+        "style_balance_kept_style_ids": [],
+        "style_balance_total_samples": None,
+    }
+
+    if args.style_balanced_subset:
+        before_n = len(paths)
+        counts = np.bincount(y_style.astype(np.int64))
+        eligible_style_ids = [int(i) for i, c in enumerate(counts.tolist()) if c >= args.style_balance_min_keep]
+
+        if not eligible_style_ids:
+            log(
+                "style-balanced: нет стилей с поддержкой "
+                f">={args.style_balance_min_keep} — пропускаю уравнивание."
+            )
+        else:
+            if args.style_balance_per_style is not None:
+                k = int(args.style_balance_per_style)
+            else:
+                k = int(before_n // max(1, len(eligible_style_ids)))
+                k = max(args.style_balance_min_keep, k)
+
+            eligible_style_ids0 = list(eligible_style_ids)
+            eligible_style_ids = [sid for sid in eligible_style_ids0 if counts[sid] >= k]
+            if not eligible_style_ids:
+                k = int(args.style_balance_min_keep)
+                eligible_style_ids = eligible_style_ids0
+
+            if eligible_style_ids:
+                k = int(min(k, min(counts[sid] for sid in eligible_style_ids)))
+
+            rng = np.random.default_rng(cfg.random_seed)
+            sel: list[int] = []
+            for sid in sorted(eligible_style_ids):
+                idxs = np.flatnonzero(y_style == sid).astype(np.int64)
+                if idxs.shape[0] < k:
+                    continue
+                picked = rng.choice(idxs, size=k, replace=False)
+                sel.extend(picked.tolist())
+
+            sel = np.array(sorted(set(sel)), dtype=np.int64)
+            if sel.shape[0] == 0:
+                log("style-balanced: после отбора не осталось данных — пропускаю уравнивание.")
+            else:
+                paths = [paths[i] for i in sel.tolist()]
+                y_type = y_type[sel]
+                attr_mat = attr_mat[sel]
+                y_color = y_color[sel]
+                y_style = y_style[sel]
+
+                style_balance_info["style_balance_per_style"] = int(k)
+                style_balance_info["style_balance_kept_style_ids"] = sorted(int(s) for s in set(y_style.tolist()))
+                style_balance_info["style_balance_total_samples"] = int(sel.shape[0])
+
     num_type, num_color, num_style = len(type_names), len(color_idx) + 1, len(style_idx) + 1
     color_class_to_group, color_group_names = build_color_group_mapping(color_names, num_color)
 
@@ -191,6 +260,7 @@ def main() -> None:
         "split_stratify": args.split_stratify,
         "style_stratify_min_freq": args.style_stratify_min_freq,
         "min_style_frequency_filter": args.min_style_frequency,
+        **style_balance_info,
         "n_samples": n_samples,
     }
     reuse_splits = splits_path.exists() and manifest_path.exists() and not cfg.rebuild_splits
@@ -201,10 +271,21 @@ def main() -> None:
     if reuse_splits:
         train_idx, val_idx, test_idx = load_splits(splits_path)
     else:
-        stratify_y = build_split_stratify_array(y_type, y_style, args.split_stratify, args.style_stratify_min_freq)
-        train_idx, val_idx, test_idx = make_stratified_splits(
-            stratify_y, all_idx, cfg.random_seed, cfg.train_ratio, cfg.val_ratio, cfg.test_ratio
-        )
+        if args.split_stratify == "style_coverage":
+            train_idx, val_idx, test_idx = make_style_coverage_splits(
+                y_style=y_style,
+                indices=all_idx,
+                seed=cfg.random_seed,
+                train_ratio=cfg.train_ratio,
+                val_ratio=cfg.val_ratio,
+                test_ratio=cfg.test_ratio,
+                min_per_split=1,
+            )
+        else:
+            stratify_y = build_split_stratify_array(y_type, y_style, args.split_stratify, args.style_stratify_min_freq)
+            train_idx, val_idx, test_idx = make_stratified_splits(
+                stratify_y, all_idx, cfg.random_seed, cfg.train_ratio, cfg.val_ratio, cfg.test_ratio
+            )
         save_splits(splits_path, train_idx, val_idx, test_idx)
         manifest_path.write_text(json.dumps(subset_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 

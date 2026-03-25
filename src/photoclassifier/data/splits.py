@@ -51,6 +51,76 @@ def make_stratified_splits(
     return np.sort(tr_idx), np.sort(va_idx), np.sort(te_idx)
 
 
+def make_style_coverage_splits(
+    y_style: np.ndarray,
+    indices: np.ndarray | None,
+    seed: int,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+    min_per_split: int = 1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Разбиение, которое гарантирует присутствие каждого стиля в val/test
+    (при достаточной поддержке в y_style).
+
+    Идея: для каждого класса стиля отдельно распределяем его примеры между
+    train/val/test с учётом долей, но не меньше min_per_split в val и test.
+    """
+    y_style = np.asarray(y_style, dtype=np.int64)
+    if indices is None:
+        indices = np.arange(len(y_style), dtype=np.int64)
+
+    if abs(train_ratio + val_ratio + test_ratio - 1.0) > 1e-6:
+        raise ValueError("train_ratio + val_ratio + test_ratio должны суммироваться в 1")
+
+    rng = np.random.default_rng(seed)
+
+    train: list[int] = []
+    val: list[int] = []
+    test: list[int] = []
+
+    # Перебор классов стиля только по выбранным indices
+    for sid in np.unique(y_style[indices]).tolist():
+        idxs = indices[y_style[indices] == sid]
+        idxs = np.asarray(idxs, dtype=np.int64)
+        rng.shuffle(idxs)
+        n = int(idxs.shape[0])
+
+        # Минимальные гарантии для val/test, остальное уходит в train
+        n_val = max(min_per_split, int(round(n * val_ratio)))
+        n_test = max(min_per_split, int(round(n * test_ratio)))
+        n_train = n - n_val - n_test
+
+        # Если слишком мало примеров для гарантий — снижаем n_val/n_test,
+        # чтобы хотя бы train был не пустым.
+        if n_train < 1:
+            # Пытаемся уменьшить val/test, сохраняя минимум
+            while n_train < 1 and (n_val > min_per_split or n_test > min_per_split):
+                if n_val >= n_test and n_val > min_per_split:
+                    n_val -= 1
+                elif n_test > min_per_split:
+                    n_test -= 1
+                n_train = n - n_val - n_test
+
+        if n_val + n_test > n:
+            # На совсем редких классах — fallback: весь класс в train.
+            n_val = 0
+            n_test = 0
+            n_train = n
+
+        if n_train > 0:
+            train.extend(idxs[:n_train].tolist())
+        if n_val > 0:
+            val.extend(idxs[n_train : n_train + n_val].tolist())
+        if n_test > 0:
+            test.extend(idxs[n_train + n_val : n_train + n_val + n_test].tolist())
+
+    return np.sort(np.asarray(train, dtype=np.int64)), np.sort(np.asarray(val, dtype=np.int64)), np.sort(
+        np.asarray(test, dtype=np.int64)
+    )
+
+
 def save_splits(path: Path, train: np.ndarray, val: np.ndarray, test: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(path, train=train, val=val, test=test)
