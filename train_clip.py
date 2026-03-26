@@ -96,6 +96,23 @@ def main() -> None:
     )
     parser.add_argument("--style-stratify-min-freq", type=int, default=5)
     parser.add_argument("--min-style-frequency", type=int, default=0)
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=0,
+        help="Количество эпох без улучшений val_avg_macro_f1 для ранней остановки (0 = отключено).",
+    )
+    parser.add_argument(
+        "--min-delta",
+        type=float,
+        default=0.001,
+        help="Минимальное улучшение val_avg_macro_f1, чтобы считаться прогрессом.",
+    )
+    parser.add_argument(
+        "--freeze-backbone",
+        action="store_true",
+        help="Заморозить веса энкодера изображений CLIP (режим Linear Probing).",
+    )
     args = parser.parse_args()
 
     if args.full_dataset and args.max_samples is not None:
@@ -324,6 +341,11 @@ def main() -> None:
             "color": split_stratify_stats(y_color, train_idx, val_idx, test_idx, "color"),
             "style": split_stratify_stats(y_style, train_idx, val_idx, test_idx, "style"),
         },
+        "early_stopping": {
+            "patience": args.patience,
+            "min_delta": args.min_delta,
+        },
+        "freeze_backbone": args.freeze_backbone,
     }
     (cfg.output_dir / "dataset_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -360,7 +382,14 @@ def main() -> None:
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, **_dl_kwargs(cfg.num_workers_eval))
     test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, **_dl_kwargs(cfg.num_workers_eval))
 
-    model = MultiTaskCLIP(num_type, num_color, num_style, model_name=args.variant, pretrained="laion2b_s34b_b79k").to(device)
+    model = MultiTaskCLIP(
+        num_type, 
+        num_color, 
+        num_style, 
+        model_name=args.variant, 
+        pretrained="laion2b_s34b_b79k",
+        freeze_backbone=args.freeze_backbone
+    ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs)
     ce = nn.CrossEntropyLoss()
@@ -406,6 +435,7 @@ def main() -> None:
     history_rows: list[dict] = []
     best_score = -1.0
     best_path = cfg.output_dir / "best_model.pt"
+    epochs_no_improve = 0
     t_train0 = time.perf_counter()
     for epoch in range(1, cfg.epochs + 1):
         t0 = time.perf_counter()
@@ -438,9 +468,22 @@ def main() -> None:
         history_rows.append(row)
         pd.DataFrame(history_rows).to_csv(cfg.output_dir / "training_log.csv", index=False)
         score = (metrics["type_macro_f1"] + metrics["color_macro_f1"] + metrics["style_macro_f1"]) / 3.0
-        if score > best_score:
+        
+        postfix = (
+            f"tl={tr['loss']:.3f} vl={va['loss']:.3f} "
+            f"t_acc={metrics['type_accuracy']:.2f} f1_avg={score:.3f}"
+        )
+        log(f"Эпоха {epoch}/{cfg.epochs}: {postfix}")
+
+        if score > best_score + args.min_delta:
             best_score = score
+            epochs_no_improve = 0
             torch.save({"model": model.state_dict(), "epoch": epoch, "metrics": metrics, "config": config_to_jsonable(cfg)}, best_path)
+        else:
+            epochs_no_improve += 1
+            if args.patience > 0 and epochs_no_improve >= args.patience:
+                log(f"Ранняя остановка на эпохе {epoch}, так как метрика не улучшалась {args.patience} эпох.")
+                break
 
     training_wall = time.perf_counter() - t_train0
     (cfg.output_dir / "training_summary.json").write_text(

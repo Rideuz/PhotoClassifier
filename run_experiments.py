@@ -26,7 +26,7 @@ def load_plan(path: Path) -> dict:
     return data
 
 
-def _to_cli_flags(params: dict) -> list[str]:
+    def _to_cli_flags(params: dict) -> list[str]:
     flags: list[str] = []
     for k, v in params.items():
         flag = f"--{k.replace('_', '-')}"
@@ -83,7 +83,9 @@ def main() -> None:
     print(f"[series] experiments={len(experiments)}")
 
     for idx, exp in enumerate(experiments, start=1):
-        cmd = build_command(base_output_dir, exp, common, train_script)
+        # Allow experiments to override output_dir (useful for saving to separate logic folders)
+        exp_output_dir = exp.get("output_dir", base_output_dir)
+        cmd = build_command(exp_output_dir, exp, common, train_script)
         name = str(exp.get("name", f"exp_{idx}"))
         print(f"\n[{idx}/{len(experiments)}] {name}")
         print(" ".join(cmd))

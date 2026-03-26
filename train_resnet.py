@@ -242,6 +242,18 @@ def main() -> None:
         help="Сколько примеров оставлять на каждый стиль в style-balanced режиме. "
         "Если не задано — вычисляется автоматически из max_samples и числа стилей.",
     )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=0,
+        help="Количество эпох без улучшений val_avg_macro_f1 для ранней остановки (0 = отключено).",
+    )
+    parser.add_argument(
+        "--min-delta",
+        type=float,
+        default=0.001,
+        help="Минимальное улучшение val_avg_macro_f1, чтобы считаться прогрессом.",
+    )
     args = parser.parse_args()
 
     if args.full_dataset and args.max_samples is not None:
@@ -579,6 +591,10 @@ def main() -> None:
             "color": split_stratify_stats(y_color, train_idx, val_idx, test_idx, "color"),
             "style": split_stratify_stats(y_style, train_idx, val_idx, test_idx, "style"),
         },
+        "early_stopping": {
+            "patience": args.patience,
+            "min_delta": args.min_delta,
+        },
     }
     (cfg.output_dir / "dataset_meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -709,6 +725,7 @@ def main() -> None:
     history_rows = []
     best_score = -1.0
     best_path = cfg.output_dir / "best_model.pt"
+    epochs_no_improve = 0
     t_train0 = time.perf_counter()
 
     log(
@@ -780,8 +797,10 @@ def main() -> None:
             epoch_iter.set_postfix_str(postfix)
         else:
             log(f"Эпоха {epoch}/{cfg.epochs}: {postfix}")
-        if score > best_score:
+
+        if score > best_score + args.min_delta:
             best_score = score
+            epochs_no_improve = 0
             torch.save(
                 {
                     "model": model.state_dict(),
@@ -791,6 +810,11 @@ def main() -> None:
                 },
                 best_path,
             )
+        else:
+            epochs_no_improve += 1
+            if args.patience > 0 and epochs_no_improve >= args.patience:
+                log(f"Ранняя остановка на эпохе {epoch}, так как метрика не улучшалась {args.patience} эпох.")
+                break
 
     training_wall = time.perf_counter() - t_train0
     (cfg.output_dir / "training_summary.json").write_text(
