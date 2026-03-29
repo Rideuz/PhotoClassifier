@@ -26,7 +26,7 @@ def load_plan(path: Path) -> dict:
     return data
 
 
-    def _to_cli_flags(params: dict) -> list[str]:
+def _to_cli_flags(params: dict) -> list[str]:
     flags: list[str] = []
     for k, v in params.items():
         flag = f"--{k.replace('_', '-')}"

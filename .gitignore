@@ -61,6 +61,7 @@ env/
 .env
 .env.*
 !.env.example
+photoenv
 
 # --- Инструменты / IDE ---
 .idea/
