@@ -6,6 +6,12 @@ import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
 
+# DeepFashion может содержать отдельные очень большие изображения.
+# Не блокируем загрузку по лимиту PIL и вручную ограничиваем размер ниже.
+Image.MAX_IMAGE_PIXELS = None
+MAX_SAFE_IMAGE_SIDE = 4096
+RESAMPLE_BILINEAR = getattr(Image, "Resampling", Image).BILINEAR
+
 
 class DeepFashionMultiTaskDataset(Dataset):
     def __init__(
@@ -38,7 +44,12 @@ class DeepFashionMultiTaskDataset(Dataset):
 
     def __getitem__(self, idx: int):
         p = self._disk_path(self.paths[idx])
-        img = Image.open(p).convert("RGB")
+        img = Image.open(p)
+        # Защита от экстремально больших изображений: уменьшаем до безопасного размера
+        # до применения torchvision-аугментаций.
+        if max(img.size) > MAX_SAFE_IMAGE_SIDE:
+            img.thumbnail((MAX_SAFE_IMAGE_SIDE, MAX_SAFE_IMAGE_SIDE), RESAMPLE_BILINEAR)
+        img = img.convert("RGB")
         if self.transform is not None:
             img = self.transform(img)
         return {

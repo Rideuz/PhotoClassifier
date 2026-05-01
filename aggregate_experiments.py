@@ -79,22 +79,39 @@ def collect_runs(runs_root: Path) -> list[dict]:
         if not test_m and not train_s:
             continue
 
+        loss_w = dmeta.get("loss_weights", {}) if isinstance(dmeta.get("loss_weights"), dict) else {}
+        style_loss_info = dmeta.get("style_loss", {}) if isinstance(dmeta.get("style_loss"), dict) else {}
+
         rec: dict = {
             "run_dir": str(run_dir),
             "run_name": run_dir.name,
             "architecture": _safe_get(dmeta, "architecture", _safe_get(train_s, "architecture")),
             "model_name": _safe_get(dmeta, "model_name", _safe_get(train_s, "model_name")),
             "started_at_local": _safe_get(exp_manifest, "started_at_local"),
-            "epochs": _numeric_or_none(_safe_get(train_s, "epochs")),
+            # --- обучение ---
+            "epochs_planned": _numeric_or_none(_safe_get(train_s, "epochs_planned", _safe_get(train_s, "epochs"))),
+            "epochs_completed": _numeric_or_none(_safe_get(train_s, "epochs_completed")),
+            "early_stopped": _safe_get(train_s, "early_stopped"),
+            "best_val_avg_macro_f1": _numeric_or_none(_safe_get(train_s, "best_val_avg_macro_f1")),
             "training_wall_time_sec": _numeric_or_none(_safe_get(train_s, "total_wall_time_sec")),
+            # --- данные ---
             "num_samples": _numeric_or_none(_safe_get(dmeta, "num_samples")),
             "batch_size": _numeric_or_none(_safe_get(dmeta, "batch_size")),
             "lr": _numeric_or_none(_safe_get(dmeta, "lr")),
+            "weight_decay": _numeric_or_none(_safe_get(dmeta, "weight_decay")),
+            "image_size": _numeric_or_none(_safe_get(dmeta, "image_size")),
             "split_stratify": _safe_get(dmeta, "split_stratify"),
             "min_style_frequency_filter": _numeric_or_none(_safe_get(dmeta, "min_style_frequency_filter")),
+            # --- веса потерь ---
+            "loss_weight_type": _numeric_or_none(loss_w.get("type")),
+            "loss_weight_color": _numeric_or_none(loss_w.get("color")),
+            "loss_weight_style": _numeric_or_none(loss_w.get("style")),
+            "style_loss_mode": _safe_get(style_loss_info, "mode", "ce"),
         }
+        # test_metrics — все числовые поля с префиксом test_
         for k, v in test_m.items():
             rec[f"test_{k}"] = _numeric_or_none(v) if isinstance(v, (int, float)) else v
+        # efficiency — все числовые поля с префиксом eff_
         for k, v in eff.items():
             rec[f"eff_{k}"] = _numeric_or_none(v) if isinstance(v, (int, float)) else v
         records.append(rec)
@@ -112,18 +129,44 @@ def make_markdown_report(df: pd.DataFrame, out_path: Path, top_k: int) -> None:
         "architecture",
         "model_name",
         "run_name",
+        "started_at_local",
+        # --- composite scores ---
         "score_quality_macro_f1_avg",
         "score_realtime",
         "score_catalog",
+        # --- test quality ---
         "test_type_macro_f1",
         "test_color_macro_f1",
         "test_style_macro_f1",
         "test_type_accuracy",
+        "test_color_accuracy",
+        "test_style_accuracy",
+        "test_type_topk_accuracy",
+        "test_color_coarse_group_accuracy",
+        # --- best val ---
+        "best_val_avg_macro_f1",
+        # --- efficiency ---
         "eff_inference_ms_per_image_batch1",
+        "eff_inference_ms_per_image_batchN",
         "eff_weights_disk_mb",
+        "eff_param_count",
+        # --- training info ---
         "training_wall_time_sec",
+        "epochs_planned",
+        "epochs_completed",
+        "early_stopped",
+        # --- hyperparams ---
         "num_samples",
-        "epochs",
+        "batch_size",
+        "lr",
+        "weight_decay",
+        "image_size",
+        "loss_weight_type",
+        "loss_weight_color",
+        "loss_weight_style",
+        "style_loss_mode",
+        "split_stratify",
+        "min_style_frequency_filter",
     ]
     cols_view = [c for c in cols_view if c in df.columns]
 

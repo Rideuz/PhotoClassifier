@@ -183,6 +183,8 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda" and cfg.amp
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     anno_dir = cfg.data_root / cfg.anno_subdir
     attr_cloth = anno_dir / "list_attr_cloth.txt"
@@ -575,6 +577,20 @@ def main() -> None:
     }
     pd.DataFrame([summary_csv]).to_csv(cfg.output_dir / "final_summary.csv", index=False)
     print("Готово. Артефакты в", cfg.output_dir)
+
+    # Авто-обновление leaderboard после каждого прогона
+    try:
+        import subprocess as _sp
+        _runs_root = cfg.output_dir.parent
+        _sp.run(
+            [sys.executable, str(ROOT / "aggregate_experiments.py"),
+             "--runs-root", str(_runs_root),
+             "--out-dir", "experiments/reports/latest"],
+            check=False, cwd=ROOT,
+        )
+        log("Leaderboard обновлён: experiments/reports/latest/")
+    except Exception as _e:
+        log(f"Предупреждение: авто-агрегация не удалась ({_e})")
 
 
 if __name__ == "__main__":

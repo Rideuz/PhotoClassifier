@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
@@ -55,6 +56,17 @@ from photoclassifier.metrics.multitask import (
 )
 from photoclassifier.models.efficientnet_multitask import MultiTaskEfficientNet
 from photoclassifier.utils.repro import hardware_and_versions_report, set_seed
+
+
+def focal_loss_multiclass(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    gamma: float = 2.0,
+    alpha: torch.Tensor | None = None,
+) -> torch.Tensor:
+    ce = F.cross_entropy(logits, targets, reduction="none", weight=alpha)
+    pt = torch.exp(-ce)
+    return ((1.0 - pt) ** gamma * ce).mean()
 
 
 def main() -> None:
@@ -97,6 +109,18 @@ def main() -> None:
     parser.add_argument("--style-stratify-min-freq", type=int, default=5)
     parser.add_argument("--min-style-frequency", type=int, default=0)
     parser.add_argument(
+        "--style-loss",
+        choices=("ce", "ce_weighted", "focal"),
+        default="ce",
+        help="Функция потерь для style-головы.",
+    )
+    parser.add_argument(
+        "--style-focal-gamma",
+        type=float,
+        default=2.0,
+        help="Gamma для focal loss (используется при --style-loss focal).",
+    )
+    parser.add_argument(
         "--patience",
         type=int,
         default=0,
@@ -107,6 +131,12 @@ def main() -> None:
         type=float,
         default=0.001,
         help="Минимальное улучшение val_avg_macro_f1, чтобы считаться прогрессом.",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Применить torch.compile к модели (PyTorch 2.0+). Ускоряет обучение на ~10-30%%, "
+             "первая эпоха медленнее из-за компиляции.",
     )
     args = parser.parse_args()
 
@@ -178,6 +208,16 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda" and cfg.amp
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+    log(
+        f"Устройство: {device}"
+        + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else "")
+        + f"; AMP={use_amp}; batch_size={cfg.batch_size}; image_size={cfg.image_size}; "
+        f"train_workers={cfg.num_workers}; eval_workers={cfg.num_workers_eval}. "
+        "Загрузка GPU часто упирается в декод JPEG на CPU: при низкой утилизации GPU попробуйте "
+        "увеличить --num-workers (2–8) и/или batch_size, если хватает VRAM."
+    )
 
     anno_dir = cfg.data_root / cfg.anno_subdir
     attr_cloth = anno_dir / "list_attr_cloth.txt"
@@ -340,6 +380,10 @@ def main() -> None:
             "patience": args.patience,
             "min_delta": args.min_delta,
         },
+        "style_loss": {
+            "mode": args.style_loss,
+            "focal_gamma": args.style_focal_gamma,
+        },
     }
     (cfg.output_dir / "dataset_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -377,9 +421,41 @@ def main() -> None:
     test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False, **_dl_kwargs(cfg.num_workers_eval))
 
     model = MultiTaskEfficientNet(num_type, num_color, num_style, variant=args.variant, pretrained=cfg.pretrained).to(device)
+    if args.compile and hasattr(torch, "compile"):
+        model = torch.compile(model)
+        log("torch.compile включён — первая эпоха медленнее, далее быстрее.")
+    elif args.compile:
+        log("Предупреждение: --compile указан, но torch.compile недоступен (требуется PyTorch 2.0+).")
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs)
     ce = nn.CrossEntropyLoss()
+    style_counts = np.bincount(y_style[train_idx].astype(np.int64), minlength=num_style).astype(np.float32)
+    style_counts = np.maximum(style_counts, 1.0)
+    style_weight_np = style_counts.sum() / (num_style * style_counts)
+    style_weight_np = style_weight_np / style_weight_np.mean()
+    style_weight_t = torch.tensor(style_weight_np, dtype=torch.float32, device=device)
+
+    if args.style_loss == "ce":
+        style_loss_name = "cross_entropy"
+
+        def style_loss_fn(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+            return ce(logits, targets)
+
+    elif args.style_loss == "ce_weighted":
+        style_loss_name = "cross_entropy_weighted"
+
+        def style_loss_fn(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+            return F.cross_entropy(logits, targets, weight=style_weight_t)
+
+    else:
+        style_loss_name = f"focal(gamma={args.style_focal_gamma})"
+
+        def style_loss_fn(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+            return focal_loss_multiclass(
+                logits, targets, gamma=args.style_focal_gamma, alpha=style_weight_t
+            )
+
+    log(f"Style loss: {style_loss_name}")
     try:
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     except (TypeError, AttributeError):
@@ -407,7 +483,8 @@ def main() -> None:
             with torch.set_grad_enabled(train_mode):
                 with _autocast():
                     out = model(x)
-                    lt, lc, ls = ce(out["type"], yt), ce(out["color"], yc), ce(out["style"], ys)
+                    lt, lc = ce(out["type"], yt), ce(out["color"], yc)
+                    ls = style_loss_fn(out["style"], ys)
                     loss = cfg.loss_weights["type"] * lt + cfg.loss_weights["color"] * lc + cfg.loss_weights["style"] * ls
             if train_mode:
                 scaler.scale(loss).backward()
@@ -424,7 +501,10 @@ def main() -> None:
     best_path = cfg.output_dir / "best_model.pt"
     epochs_no_improve = 0
     t_train0 = time.perf_counter()
+    last_epoch = 0
+    stopped_early = False
     for epoch in range(1, cfg.epochs + 1):
+        last_epoch = epoch
         t0 = time.perf_counter()
         tr = run_epoch(train_loader, True)
         sched.step()
@@ -470,6 +550,7 @@ def main() -> None:
             epochs_no_improve += 1
             if args.patience > 0 and epochs_no_improve >= args.patience:
                 log(f"Ранняя остановка на эпохе {epoch}, так как метрика не улучшалась {args.patience} эпох.")
+                stopped_early = True
                 break
 
     training_wall = time.perf_counter() - t_train0
@@ -479,7 +560,11 @@ def main() -> None:
                 "architecture": "efficientnet",
                 "model_name": f"efficientnet_{args.variant}",
                 "total_wall_time_sec": training_wall,
-                "epochs": cfg.epochs,
+                "epochs_planned": cfg.epochs,
+                "epochs_completed": last_epoch,
+                "early_stopped": stopped_early,
+                "early_stopping_patience": args.patience,
+                "early_stopping_min_delta": args.min_delta,
                 "best_val_avg_macro_f1": best_score,
                 "checkpoint": str(best_path),
             },
@@ -562,6 +647,20 @@ def main() -> None:
     }
     pd.DataFrame([summary_csv]).to_csv(cfg.output_dir / "final_summary.csv", index=False)
     print("Готово. Артефакты в", cfg.output_dir)
+
+    # Авто-обновление leaderboard после каждого прогона
+    try:
+        import subprocess as _sp
+        _runs_root = cfg.output_dir.parent
+        _sp.run(
+            [sys.executable, str(ROOT / "aggregate_experiments.py"),
+             "--runs-root", str(_runs_root),
+             "--out-dir", "experiments/reports/latest"],
+            check=False, cwd=ROOT,
+        )
+        log("Leaderboard обновлён: experiments/reports/latest/")
+    except Exception as _e:
+        log(f"Предупреждение: авто-агрегация не удалась ({_e})")
 
 
 if __name__ == "__main__":

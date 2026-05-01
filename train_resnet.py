@@ -254,6 +254,12 @@ def main() -> None:
         default=0.001,
         help="Минимальное улучшение val_avg_macro_f1, чтобы считаться прогрессом.",
     )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Применить torch.compile к модели (PyTorch 2.0+). Ускоряет обучение на ~10-30%%, "
+             "первая эпоха медленнее из-за компиляции.",
+    )
     args = parser.parse_args()
 
     if args.full_dataset and args.max_samples is not None:
@@ -328,6 +334,8 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda" and cfg.amp
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
     log(f"Устройство: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
     if device.type != "cuda":
         log("CUDA недоступна — обучение на CPU будет заметно медленнее.")
@@ -664,6 +672,11 @@ def main() -> None:
     log("Создаю модель: ResNet50 (ImageNet) + головы type/color/style…")
     model = MultiTaskResNet(num_type, num_color, num_style, pretrained=cfg.pretrained)
     model = model.to(device)
+    if args.compile and hasattr(torch, "compile"):
+        model = torch.compile(model)
+        log("torch.compile включён — первая эпоха медленнее, далее быстрее.")
+    elif args.compile:
+        log("Предупреждение: --compile указан, но torch.compile недоступен (требуется PyTorch 2.0+).")
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.epochs)
@@ -964,6 +977,20 @@ def main() -> None:
     pd.DataFrame([summary_csv]).to_csv(cfg.output_dir / "final_summary.csv", index=False)
 
     print("Готово. Артефакты в", cfg.output_dir)
+
+    # Авто-обновление leaderboard после каждого прогона
+    try:
+        import subprocess as _sp
+        _runs_root = cfg.output_dir.parent
+        _sp.run(
+            [sys.executable, str(ROOT / "aggregate_experiments.py"),
+             "--runs-root", str(_runs_root),
+             "--out-dir", "experiments/reports/latest"],
+            check=False, cwd=ROOT,
+        )
+        log("Leaderboard обновлён: experiments/reports/latest/")
+    except Exception as _e:
+        log(f"Предупреждение: авто-агрегация не удалась ({_e})")
 
 
 if __name__ == "__main__":
